@@ -7,6 +7,7 @@ declarative handlers for component creation and network registration.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -148,6 +149,8 @@ class VnfImporter:
     }
 
     _SECTION_PATTERNS: ClassVar[dict[str, Pattern[str]]] = {name: make_section_pattern(name) for name in _HANDLERS}
+    _SECTION_HEADER_PATTERN: ClassVar[Pattern[str]] = re.compile(rf"\[({'|'.join(map(re.escape, _HANDLERS))})\]\s")
+    _SECTION_BOUNDARY_PATTERN: ClassVar[Pattern[str]] = re.compile(r"^\[", re.MULTILINE)
 
     def _get_and_migrate_vnf_content(self, path: Path, *, native_check: bool = True) -> str:
         """Load VNF file content with automatic version migration for legacy files.
@@ -193,9 +196,31 @@ class VnfImporter:
             raw_text: Complete file content for section extraction.
 
         """
+
+        def find_header_bounds() -> dict[str, tuple[int, int]]:
+            """Index the first and last possible body starts for each section type."""
+            bounds: dict[str, tuple[int, int]] = {}
+            for match in self._SECTION_HEADER_PATTERN.finditer(raw_text):
+                name = match.group(1)
+                first, _ = bounds.get(name, (match.end(), match.end()))
+                bounds[name] = (first, match.end())
+            return bounds
+
+        def find_section_end(last_body_start: int) -> int:
+            """Find the first boundary strictly after the final possible body start."""
+            # Keep boundaries at the body start searchable for legacy empty matches.
+            boundary_index = bisect_right(boundaries, last_body_start)
+            return boundaries[boundary_index] if boundary_index < len(boundaries) else len(raw_text)
+
+        boundaries = [match.start() for match in self._SECTION_BOUNDARY_PATTERN.finditer(raw_text)]
+        section_bounds = find_header_bounds()
+
         for name, handler in self._HANDLERS.items():
+            if name not in section_bounds:
+                continue
+            first, last = section_bounds[name]
             pattern = self._SECTION_PATTERNS[name]
-            for match in pattern.finditer(raw_text):
+            for match in pattern.finditer(raw_text, first, find_section_end(last)):
                 chunk = match.group(0).rstrip() + "\n#END"
                 handler.handle(network, chunk)
 
